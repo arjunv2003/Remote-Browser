@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 load_dotenv()
 
@@ -22,6 +23,13 @@ app = FastAPI(title="SocioShop Browser Broker")
 MY_IP = os.getenv("MY_IP", "localhost")
 PORT_START = int(os.getenv("PORT_START", "6080"))
 PORT_END = int(os.getenv("PORT_END", "6180"))
+NEKO_UDP_PORT_START = int(os.getenv("NEKO_UDP_PORT_START", "52000"))
+NEKO_UDP_PORTS_PER_SESSION = int(os.getenv("NEKO_UDP_PORTS_PER_SESSION", "32"))
+NEKO_IMAGE = os.getenv("NEKO_IMAGE", "socioshop-browser:latest")
+NEKO_USER_PASSWORD = os.getenv("NEKO_USER_PASSWORD", "shopper")
+NEKO_ADMIN_PASSWORD = os.getenv("NEKO_ADMIN_PASSWORD", "admin")
+NEKO_SCREEN = os.getenv("NEKO_SCREEN", "1280x720@30")
+SESSION_BOOT_SECONDS = int(os.getenv("SESSION_BOOT_SECONDS", "10"))
 
 sessions: dict[str, dict] = {}
 docker_client = docker.from_env()
@@ -48,6 +56,24 @@ def free_port() -> int:
     raise Exception("No free ports")
 
 
+def free_udp_block() -> tuple[int, int]:
+    size = max(1, NEKO_UDP_PORTS_PER_SESSION)
+    used_ports = set()
+    for session in sessions.values():
+        used_ports.update(range(session["udp_start"], session["udp_end"] + 1))
+
+    candidate = NEKO_UDP_PORT_START
+    while candidate + size - 1 <= 65535:
+        block = range(candidate, candidate + size)
+        if all(port not in used_ports for port in block) and _port_range_available(
+            candidate, candidate + size - 1, socket.SOCK_DGRAM
+        ):
+            return candidate, candidate + size - 1
+        candidate += size
+
+    raise Exception("No free UDP port blocks")
+
+
 def container_name(order_id: str) -> str:
     # Docker name must match: [a-zA-Z0-9][a-zA-Z0-9_.-]+
     # Use a short stable hash suffix to avoid collisions.
@@ -68,6 +94,22 @@ def _port_available(port: int) -> bool:
         return True
 
 
+def _port_range_available(start: int, end: int, sock_type: int) -> bool:
+    sockets = []
+    try:
+        for port in range(start, end + 1):
+            sock = socket.socket(socket.AF_INET, sock_type)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", port))
+            sockets.append(sock)
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+    return True
+
+
 @app.post("/sessions/start", response_model=SessionResponse)
 async def start_session(req: StartRequest):
     try:
@@ -86,6 +128,7 @@ async def start_session(req: StartRequest):
         )
 
     port = free_port()
+    udp_start, udp_end = free_udp_block()
     name = container_name(req.order_id)
 
     # Clean up any leftover container with the same name
@@ -97,26 +140,43 @@ async def start_session(req: StartRequest):
 
     print(f"\n🚀 Order {req.order_id} → port {port}...")
 
+    port_bindings = {"8080/tcp": port}
+    for udp_port in range(udp_start, udp_end + 1):
+        port_bindings[f"{udp_port}/udp"] = udp_port
+
+    environment = {
+        "NEKO_DESKTOP_SCREEN": NEKO_SCREEN,
+        "NEKO_MEMBER_MULTIUSER_USER_PASSWORD": NEKO_USER_PASSWORD,
+        "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD": NEKO_ADMIN_PASSWORD,
+        "NEKO_WEBRTC_EPR": f"{udp_start}-{udp_end}",
+        "NEKO_WEBRTC_NAT1TO1": MY_IP,
+        "NEKO_WEBRTC_ICELITE": "1",
+        "START_URL": req.start_url,
+    }
+
     container = docker_client.containers.run(
-        image="socioshop-browser:latest",
+        image=NEKO_IMAGE,
         detach=True,
         auto_remove=True,
         name=name,
-        ports={"6080/tcp": port},
-        environment={"START_URL": req.start_url},
+        ports=port_bindings,
+        environment=environment,
+        cap_add=["SYS_ADMIN"],
         shm_size="2g",
         mem_limit="1g",
     )
 
-    await asyncio.sleep(8)
+    await asyncio.sleep(SESSION_BOOT_SECONDS)
 
-    browser_url = f"http://{MY_IP}:{port}/?autoconnect=true&resize=scale&quality=8"
+    browser_url = f"http://{MY_IP}:{port}/?{urlencode({'usr': req.order_id, 'pwd': NEKO_USER_PASSWORD})}"
 
     session = {
         "order_id": req.order_id,
         "container_id": container.id[:12],
         "container_name": name,
         "port": port,
+        "udp_start": udp_start,
+        "udp_end": udp_end,
         "browser_url": browser_url,
         "status": "ready",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -197,7 +257,7 @@ async def ui():
 </head>
 <body>
   <h2>SocioShop Browser Broker</h2>
-  <div class="muted">Creates per-order remote browser containers (noVNC) on ports <code>{PORT_START}</code>–<code>{PORT_END}</code>.</div>
+  <div class="muted">Creates per-order Neko remote browser containers on TCP ports <code>{PORT_START}</code>–<code>{PORT_END}</code> plus per-session UDP WebRTC ranges starting at <code>{NEKO_UDP_PORT_START}</code>.</div>
 
   <div class="card">
     <div class="row">
@@ -208,6 +268,7 @@ async def ui():
       <div>
         <label>Start URL</label>
         <input id="start_url" value="https://www.google.com" />
+        
       </div>
       <div>
         <button id="start_btn">Start</button>
